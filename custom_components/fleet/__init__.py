@@ -151,7 +151,9 @@ def _valideaza_zip_entry_name(name: str) -> bool:
 
 def _update_license_notifications(hass: HomeAssistant, mgr: LicenseManager) -> None:
     """Creează sau șterge notificările de expirare licență/trial."""
-    if mgr.is_valid:
+    from .license import USE_LICENSE
+    
+    if not USE_LICENSE or mgr.is_valid:
         ir.async_delete_issue(hass, DOMAIN, "trial_expired")
         ir.async_delete_issue(hass, DOMAIN, "license_expired")
         persistent_notification.async_dismiss(hass, "fleet_license_expired")
@@ -233,86 +235,158 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # Heartbeat periodic — intervalul vine de la server (via valid_until)
         from datetime import timedelta
+        from .license import USE_LICENSE
 
-        interval_sec = license_mgr.check_interval_seconds
-        _LOGGER.debug(
-            "[Fleet] Programez heartbeat periodic la fiecare %d secunde (%d ore)",
-            interval_sec,
-            interval_sec // 3600,
-        )
-
-        async def _heartbeat_periodic(_now: Any) -> None:
-            """Verifică statusul la server dacă cache-ul a expirat.
-
-            Logică:
-            1. Captează is_valid ÎNAINTE de heartbeat
-            2. Dacă cache expirat → contactează serverul
-            3. Captează is_valid DUPĂ heartbeat
-            4. Dacă starea s-a schimbat → reload entries (tranziție curată)
-            5. Reprogramează heartbeat-ul la intervalul actualizat de server
-            """
-            mgr: LicenseManager | None = hass.data.get(DOMAIN, {}).get(
-                LICENSE_DATA_KEY
+        if USE_LICENSE:
+            interval_sec = license_mgr.check_interval_seconds
+            _LOGGER.debug(
+                "[Fleet] Programez heartbeat periodic la fiecare %d secunde (%d ore)",
+                interval_sec,
+                interval_sec // 3600,
             )
-            if not mgr:
-                _LOGGER.debug("[Fleet] Heartbeat: LicenseManager nu există, skip")
-                return
+        else:
+            interval_sec = None
 
-            # Captează starea ÎNAINTE de heartbeat
-            was_valid = mgr.is_valid
+        if USE_LICENSE:
+            async def _heartbeat_periodic(_now: Any) -> None:
+                """Verifică statusul la server dacă cache-ul a expirat.
 
-            if mgr.needs_heartbeat:
-                _LOGGER.debug("[Fleet] Heartbeat: cache expirat, verific la server")
-                await mgr.async_heartbeat()
+                Logică:
+                1. Captează is_valid ÎNAINTE de heartbeat
+                2. Dacă cache expirat → contactează serverul
+                3. Captează is_valid DUPĂ heartbeat
+                4. Dacă starea s-a schimbat → reload entries (tranziție curată)
+                5. Reprogramează heartbeat-ul la intervalul actualizat de server
+                """
+                mgr: LicenseManager | None = hass.data.get(DOMAIN, {}).get(
+                    LICENSE_DATA_KEY
+                )
+                if not mgr:
+                    _LOGGER.debug("[Fleet] Heartbeat: LicenseManager nu există, skip")
+                    return
 
-                # Captează starea DUPĂ heartbeat
-                now_valid = mgr.is_valid
+                # Captează starea ÎNAINTE de heartbeat
+                was_valid = mgr.is_valid
 
-                # Detectează tranziții pe care async_check_status nu le-a prins
-                # (ex: server inaccesibil + cache expirat → is_valid devine False)
-                if was_valid and not now_valid:
-                    _LOGGER.warning(
-                        "[Fleet] Licența a devenit invalidă — reîncarc senzorii"
+                if mgr.needs_heartbeat:
+                    _LOGGER.debug("[Fleet] Heartbeat: cache expirat, verific la server")
+                    await mgr.async_heartbeat()
+
+                    # Captează starea DUPĂ heartbeat
+                    now_valid = mgr.is_valid
+
+                    # Detectează tranziții pe care async_check_status nu le-a prins
+                    # (ex: server inaccesibil + cache expirat → is_valid devine False)
+                    if was_valid and not now_valid:
+                        _LOGGER.warning(
+                            "[Fleet] Licența a devenit invalidă — reîncarc senzorii"
+                        )
+                        _update_license_notifications(hass, mgr)
+                        await mgr._async_reload_entries()
+                    elif not was_valid and now_valid:
+                        _LOGGER.info(
+                            "[Fleet] Licența a redevenit validă — reîncarc senzorii"
+                        )
+                        _update_license_notifications(hass, mgr)
+                        await mgr._async_reload_entries()
+
+                    # Reprogramează heartbeat-ul la intervalul actualizat de server
+                    new_interval = mgr.check_interval_seconds
+                    _LOGGER.debug(
+                        "[Fleet] Heartbeat: reprogramez la %d secunde (%d min)",
+                        new_interval,
+                        new_interval // 60,
                     )
-                    _update_license_notifications(hass, mgr)
-                    await mgr._async_reload_entries()
-                elif not was_valid and now_valid:
-                    _LOGGER.info(
-                        "[Fleet] Licența a redevenit validă — reîncarc senzorii"
+                    # Oprește vechiul timer
+                    cancel_old = hass.data.get(DOMAIN, {}).get("_cancel_heartbeat")
+                    if cancel_old:
+                        cancel_old()
+                    # Programează noul timer cu intervalul actualizat
+                    cancel_new = async_track_time_interval(
+                        hass,
+                        _heartbeat_periodic,
+                        timedelta(seconds=new_interval),
                     )
-                    _update_license_notifications(hass, mgr)
-                    await mgr._async_reload_entries()
+                    hass.data[DOMAIN]["_cancel_heartbeat"] = cancel_new
+                else:
+                    _LOGGER.debug("[Fleet] Heartbeat: cache valid, nu e nevoie de verificare")
 
-                # Reprogramează heartbeat-ul la intervalul actualizat de server
-                new_interval = mgr.check_interval_seconds
+            # Stocăm cancel-ul heartbeat-ului la nivel de domeniu,
+            # NU pe entry (ca să nu dispară când se șterge prima entry)
+            cancel_heartbeat = async_track_time_interval(
+                hass,
+                _heartbeat_periodic,
+                timedelta(seconds=interval_sec),
+            )
+            hass.data[DOMAIN]["_cancel_heartbeat"] = cancel_heartbeat
+            _LOGGER.debug("[Fleet] Heartbeat programat și stocat în hass.data")
+
+            # ── Timer precis la valid_until (zero gap la expirare cache) ──
+            def _schedule_cache_expiry_check(mgr_ref: LicenseManager) -> None:
+                """Programează un check EXACT la momentul expirării cache-ului.
+
+                Elimină complet fereastra dintre expirarea cache-ului și
+                următorul heartbeat periodic. La expirare, contactează
+                serverul imediat și declanșează reload dacă starea se schimbă.
+                """
+                # Anulează timer-ul anterior (dacă există)
+                cancel_prev = hass.data.get(DOMAIN, {}).pop(
+                    "_cancel_cache_expiry", None
+                )
+                if cancel_prev:
+                    cancel_prev()
+
+                valid_until = (mgr_ref._status_token or {}).get("valid_until")
+                if not valid_until or valid_until <= 0:
+                    return
+
+                expiry_dt = dt_util.utc_from_timestamp(valid_until)
+                # Adaugă 2 secunde ca marjă (evită race condition cu cache check)
+                expiry_dt = expiry_dt + timedelta(seconds=2)
+
+                async def _on_cache_expiry(_now) -> None:
+                    """Callback executat EXACT la expirarea cache-ului."""
+                    mgr_now: LicenseManager | None = hass.data.get(
+                        DOMAIN, {}
+                    ).get(LICENSE_DATA_KEY)
+                    if not mgr_now:
+                        return
+
+                    was_valid = mgr_now.is_valid
+                    _LOGGER.debug(
+                        "[Fleet] Cache expirat — verific imediat la server"
+                    )
+                    await mgr_now.async_check_status()
+                    now_valid = mgr_now.is_valid
+
+                    if was_valid != now_valid:
+                        if now_valid:
+                            _LOGGER.info(
+                                "[Fleet] Licența a redevenit validă — reîncarc"
+                            )
+                        else:
+                            _LOGGER.warning(
+                                "[Fleet] Licența a devenit invalidă — reîncarc"
+                            )
+                        _update_license_notifications(hass, mgr_now)
+                        await mgr_now._async_reload_entries()
+
+                    # Programează următorul check (dacă serverul a dat valid_until nou)
+                    _schedule_cache_expiry_check(mgr_now)
+
+                cancel_expiry = async_track_point_in_time(
+                    hass, _on_cache_expiry, expiry_dt
+                )
+                hass.data[DOMAIN]["_cancel_cache_expiry"] = cancel_expiry
+
                 _LOGGER.debug(
-                    "[Fleet] Heartbeat: reprogramez la %d secunde (%d min)",
-                    new_interval,
-                    new_interval // 60,
+                    "[Fleet] Cache expiry timer programat la %s",
+                    expiry_dt.isoformat(),
                 )
-                # Oprește vechiul timer
-                cancel_old = hass.data.get(DOMAIN, {}).get("_cancel_heartbeat")
-                if cancel_old:
-                    cancel_old()
-                # Programează noul timer cu intervalul actualizat
-                cancel_new = async_track_time_interval(
-                    hass,
-                    _heartbeat_periodic,
-                    timedelta(seconds=new_interval),
-                )
-                hass.data[DOMAIN]["_cancel_heartbeat"] = cancel_new
-            else:
-                _LOGGER.debug("[Fleet] Heartbeat: cache valid, nu e nevoie de verificare")
 
-        # Stocăm cancel-ul heartbeat-ului la nivel de domeniu,
-        # NU pe entry (ca să nu dispară când se șterge prima entry)
-        cancel_heartbeat = async_track_time_interval(
-            hass,
-            _heartbeat_periodic,
-            timedelta(seconds=interval_sec),
-        )
-        hass.data[DOMAIN]["_cancel_heartbeat"] = cancel_heartbeat
-        _LOGGER.debug("[Fleet] Heartbeat programat și stocat în hass.data")
+            _schedule_cache_expiry_check(license_mgr)
+        else:
+            _LOGGER.info("[Fleet] License verification disabled (USE_LICENSE = False)")
 
         # ── Timer precis la valid_until (zero gap la expirare cache) ──
         def _schedule_cache_expiry_check(mgr_ref: LicenseManager) -> None:
@@ -382,20 +456,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         # ── Notificare re-enable (dacă a fost dezactivată anterior) ──
         was_disabled = hass.data.pop(f"{DOMAIN}_was_disabled", False)
-        if was_disabled:
+        if was_disabled and USE_LICENSE:
             await license_mgr.async_notify_event("integration_enabled")
 
-        if not license_mgr.is_valid:
+        if USE_LICENSE and not license_mgr.is_valid:
             _LOGGER.warning(
                 "[Fleet] Integrarea nu are licență validă. "
                 "Senzorii vor afișa 'Licență necesară'."
             )
-        elif license_mgr.is_trial_valid:
+        elif USE_LICENSE and license_mgr.is_trial_valid:
             _LOGGER.info(
                 "[Fleet] Perioadă de evaluare — %d zile rămase",
                 license_mgr.trial_days_remaining,
             )
-        else:
+        elif USE_LICENSE:
             _LOGGER.info(
                 "[Fleet] Licență activă — tip: %s",
                 license_mgr.license_type,

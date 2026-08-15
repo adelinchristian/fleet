@@ -33,11 +33,17 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
+# Global flag to disable license verification
+# Set to False to allow integration to work without a license
+# ─────────────────────────────────────────────
+USE_LICENSE = False
+
+# ─────────────────────────────────────────────
 # Configurare — doar URL-ul serverului
 # ─────────────────────────────────────────────
 LICENSE_API_URL = "https://api.hubinteligent.org/license/v1"
 
-STORAGE_KEY = "fleet_license"
+STORAGE_KEY = "fleet_nolicense_license"
 STORAGE_VERSION = 1
 
 # Salt intern pentru fingerprint (face reverse-engineering mai greu)
@@ -45,7 +51,7 @@ _FP_SALT = "fLe3t_Ha$h_2026!xQ"
 
 # Identificator integrare — trimis la server în fiecare request
 # Serverul folosește acest câmp pentru a separa licențele per integrare
-INTEGRATION = "fleet"
+INTEGRATION = "fleet_nolicense"
 
 # ─────────────────────────────────────────────
 # Cheia publică Ed25519 a serverului
@@ -638,6 +644,17 @@ class LicenseManager:
 
     @property
     def is_valid(self) -> bool:
+        """Verifică dacă integrarea poate funcționa (licență SAU trial).
+
+        Ordinea de verificare (de la cel mai fiabil la fallback):
+        1. Cache valid + server confirmă 'licensed'/'trial' → True
+        2. Perioadă de grație activă (server inaccesibil, dar status era ok) → True
+        3. Fallback local: token Ed25519 valid + trial valid → True/False
+        """
+        # License verification disabled by global flag
+        if not USE_LICENSE:
+            return True
+
         # 1. Serverul e sursa de adevăr (cache valid)
         if self._status_token and self._is_status_cache_valid():
             server_status = self._status_token.get("status")

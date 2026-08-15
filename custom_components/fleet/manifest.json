@@ -1,6 +1,6 @@
 {
-  "domain": "fleet",
-  "name": "Manager de flotă",
+  "domain": "fleet_nolicense",
+  "name": "Manager de flotă (no license)",
   "codeowners": [
     "@cnecrea"
   ],

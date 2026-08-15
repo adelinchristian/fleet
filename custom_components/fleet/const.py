@@ -5,7 +5,7 @@ from typing import Final
 # ─────────────────────────────────────────────
 # Domeniu și platforme
 # ─────────────────────────────────────────────
-DOMAIN: Final = "fleet"
+DOMAIN: Final = "fleet_nolicense"
 PLATFORMS: Final = ["sensor"]
 
 # ─────────────────────────────────────────────
