@@ -216,7 +216,7 @@ def _selector_data() -> selector.TextSelector:
 # ─────────────────────────────────────────────
 
 
-class FleetConfigFlow(config_entries.ConfigFlow, domain="fleet_nolicense"):
+class FleetConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Flux de configurare pentru adăugarea unui vehicul de transport."""
 
     VERSION = 1
